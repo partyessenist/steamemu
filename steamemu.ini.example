@@ -1,0 +1,96 @@
+; ============================================================================
+; steamemu configuration.
+;
+; Drop a copy named  steamemu.ini  next to the game's steam_api(64) library and
+; edit the values below. It is found in this order: the STEAMEMU_CONFIG env var
+; (explicit path), then steamemu.ini in the game's working directory, then
+; steamemu.ini next to the steam_api DLL/.so itself -- so it is picked up even
+; when the game runs with a different working directory. The init line in the
+; log reports which file (if any) was loaded.
+;
+; Syntax:  [sections], `key = value`, and `#` / `;` line comments.
+;          Whitespace around keys and values is trimmed. Keys are
+;          case-insensitive. Everything is optional; sensible defaults apply.
+;
+; Precedence: for the keys the emulator has always honored, an environment
+; variable still wins over the file --
+;     STEAMEMU_STEAMID  -> steam_id / account_id
+;     STEAMEMU_NAME     -> persona_name
+;     SteamAppId        -> app_id   (SteamGameId is also consulted)
+; ============================================================================
+
+# ----- identity -------------------------------------------------------------
+# Your fabricated SteamID. Give EITHER a 32-bit account id ...
+account_id  = 1000001
+# ... OR a full 64-bit SteamID (uncomment; takes precedence if both are set):
+# steam_id  = 76561197960265729
+
+# Display / persona name shown to LAN peers.
+persona_name = Player
+
+# ----- environment ----------------------------------------------------------
+# Game language and Steam UI language (ui_language defaults to language).
+language     = english
+# ui_language = english
+
+# ISO country code reported by ISteamUtils::GetIPCountry.
+country      = US
+
+# Log verbosity: off | error | warn | info | debug | trace (or 0-5). Default is
+# info (lifecycle + errors). `debug` also prints each Steam API method the game
+# calls ONCE (a coverage view of what it touches); `trace` prints EVERY call (the
+# exact sequence, e.g. while opening a menu -- best for diagnosing a problem).
+# STEAMEMU_LOG_LEVEL overrides this.
+log_level    = info
+
+# Write the log to a file. Setting it HERE (rather than the STEAMEMU_LOG env var)
+# is the reliable way for anti-cheat-relaunched games, whose process may not
+# inherit your environment but always reads this steamemu.ini from its own dir.
+# The actual file gets the process id appended -- e.g. steamemu.log.4321 -- so a
+# launcher, anti-cheat and the game each get their own file instead of clobbering
+# one; open the largest to see the gameplay process. STEAMEMU_LOG env overrides.
+# log_file   = steamemu.log
+
+# AppID override. Normally taken from steam_appid.txt / SteamAppId; set here to
+# force it.
+# app_id     = 480
+
+# Where cloud saves, stats and achievements live. Default: steamemu_storage/<appid>
+# under the game's working directory. Absolute or relative path.
+# save_path  = /home/me/.local/share/steamemu/480
+# storage_dir is an accepted alias for save_path.
+
+# ----- installed DLC --------------------------------------------------------
+# One line per owned DLC AppID: `<appid> = <name>`. The name is optional and is
+# returned from ISteamApps::BGetDLCDataByIndex. BIsDlcInstalled() reports true
+# only for AppIDs listed here; GetDLCCount() counts them.
+[dlc]
+# 12345 = Deluxe Pack
+# 67890 = Season Pass
+
+# ----- canned HTTP responses ------------------------------------------------
+# We don't ship a TLS stack, so https:// requests fail by default. If the game
+# hits an endpoint whose response you know, stub it here and it is served with
+# no network at all. Key = the request URL (matched by LONGEST prefix, so a
+# stub without the query string still matches a request that has one). Value =
+#   <status> [body]
+# where <body> is either inline text or `@file` (a path, relative to this ini,
+# whose contents become the body). `<status>` alone gives an empty body. The
+# Content-Type is inferred (application/json for JSON, text/html for HTML, else
+# text/plain). Anything not listed here still fails as before.
+[http]
+# https://auth.example.com/login   = 200 {"token":"abc123","ok":true}
+# https://api.example.com/profile  = 200 @responses/profile.json
+# https://telemetry.example.com/   = 204
+
+# ----- networking (advanced; defaults are fine for most setups) -------------
+[net]
+# Fixed UDP port for the P2P data socket. 0 (the default) picks an ephemeral
+# port, which is REQUIRED when running two instances on one host. Only set a
+# fixed port for a single-instance-per-host deployment.
+# listen_port      = 0
+
+# Multicast discovery group and port. Change on isolated LAN segments that must
+# not cross-talk with other steamemu games. Both peers must agree.
+# discovery_address = 239.198.7.4
+# discovery_port    = 47854

@@ -1,0 +1,14 @@
+/build/
+*.o
+*.so
+*.dll
+*.dylib
+compile_commands.json
+
+# Local cloud-save / stats storage written by the emulator at runtime (and tests).
+/steamemu_storage/
+steam_appid.txt
+
+# Python cache from tools/gen.py imports
+__pycache__/
+*.pyc
