@@ -69,6 +69,17 @@ public:
 	// Returns false for an out-of-range index.
 	bool DLCByIndex(int i, uint32_t* appID, bool* available, char* name, int nameBuf) const;
 
+	// --- overlay (the [overlay] section) ------------------------------------
+	// The Dear ImGui overlay hooks the game's render loop, so it is OPT-IN:
+	// `enabled` (env STEAMEMU_OVERLAY wins) defaults false. When off, the whole
+	// overlay module stays inert and IsOverlayEnabled() reports false.
+	bool OverlayEnabled() const { return m_overlayEnabled; }
+	// Toggle shortcut for showing/hiding the overlay (`hotkey`, default the real
+	// Steam overlay chord "shift+tab"). Parsed by the overlay module into a
+	// virtual-key + modifiers; an unparsable value leaves the overlay with no
+	// hotkey (it can still be driven by ActivateGameOverlay*).
+	const std::string& OverlayHotkey() const { return m_overlayHotkey; }
+
 	// --- networking overrides (nice-to-have; safe defaults) -----------------
 	// Fixed UDP port for the P2P data socket (`listen_port`); 0 => ephemeral
 	// (the default, required so two instances on one host don't collide).
@@ -116,6 +127,8 @@ private:
 	std::string m_savePath;
 	std::vector<DlcEntry> m_dlc;
 	std::vector<HttpMock> m_httpMocks;
+	bool m_overlayEnabled = false;
+	std::string m_overlayHotkey;
 	uint16_t m_listenPort = 0;
 	std::string m_discoveryAddr;
 	uint16_t m_discoveryPort = 0;

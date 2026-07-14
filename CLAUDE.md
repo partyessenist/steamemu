@@ -167,22 +167,45 @@ call into it and the networking backend can evolve independently.
 ## Overlay emulation (Dear ImGui)
 
 The real Steam overlay renders in-game (shift-tab, invite dialogs, notifications) by hooking the
-game's graphics API. We emulate it with **[Dear ImGui](https://github.com/ocornut/imgui)**: hook
-the game's present/swap path (D3D9/10/11/12, OpenGL, Vulkan) and draw our own overlay UI on top.
-This backs the interfaces that expect an overlay to exist — `ISteamFriends::ActivateGameOverlay*`,
-`ISteamUtils::IsOverlayEnabled`/`BOverlayNeedsPresent`, and the invite/notification flows — so
-games that gate features on "is the overlay up?" behave correctly, and LAN peers can be shown,
-invited, and joined through it.
+game's graphics API. We emulate it with **[Dear ImGui](https://github.com/ocornut/imgui)** — **now
+implemented** in `src/overlay/` (`STEAMEMU_ENABLE_OVERLAY`, Windows-only). It backs the interfaces
+that expect an overlay to exist — `ISteamFriends::ActivateGameOverlay*`,
+`ISteamUtils::IsOverlayEnabled`/`BOverlayNeedsPresent`, and the `GameOverlayActivated_t` pause/resume
+signal — so games that gate features on "is the overlay up?" behave correctly, and discovered LAN
+peers and lobbies are shown in the panel.
 
-Guidance:
-- ImGui is a **vendored third-party dependency** — keep it under something like `third_party/imgui`
-  and out of the ABI/interface discussion; it never crosses the Steam API boundary.
-- Isolate the graphics hooking and ImGui rendering behind an internal overlay module with a
-  backend-agnostic interface, mirroring how networking is isolated. The emulated `ISteam*` methods
-  call into that module; they must not depend on any specific renderer.
-- The overlay is **optional and late** — it depends on hooking the game's real render loop, which
-  the headless smoke test can't exercise. Do not let it block the core API/callback work; the
-  interfaces above can return sensible values with no overlay drawn until the module lands.
+How it is built (mirrors how `src/net.*` isolates the transport):
+- **ImGui is a vendored submodule** at `third_party/imgui` (pinned `v1.90.9-docking`), built as a
+  separate static lib (`steamemu_imgui`) and linked into the DLL; its symbols never cross the Steam
+  API boundary. Only the overlay TUs include ImGui.
+- **`src/overlay/overlay.h`** is an **ImGui/Win32-free facade** (`emu::OverlayManager`, singleton
+  `emu::Overlay()`). It is the ONLY overlay header the generated stub TUs and `steam_api.cpp`
+  include — no ImGui/DXGI type ever reaches an exported signature. `overlay_internal.h` (the shared
+  `OverlayImpl` state: visibility, toggle hotkey, toasts) is included only by the two backend TUs.
+- **Two mutually-exclusive backends**, exactly like eosemu. `SwapchainHook.cpp` is the primary: it
+  patches the process-wide `IDXGISwapChain::Present`/`ResizeBuffers` vtable slots (the classic
+  vtable-patch injection) and draws over the game on its own D3D11 device + render thread, hooking
+  its WndProc for input. `Overlay.cpp` is the fallback: its own top-level Win32 window + D3D11 device
+  on a background thread (never touches the game's present path — used when no game swapchain is
+  found, or forced via `STEAMEMU_OVERLAY_WINDOW` for headless testing). `Start()` tries the hook,
+  then falls back to the window. When compiled out (non-Windows), every facade method is inert and
+  `Available()` is false.
+
+Wiring:
+- **Opt-in via config**: `[overlay] enabled = 1` (env `STEAMEMU_OVERLAY` wins); toggle hotkey
+  `[overlay] hotkey` (default the real Steam chord `shift+tab`). `Config().OverlayEnabled()` /
+  `OverlayHotkey()`. `Start()` no-ops unless enabled, so the hook is never installed for games the
+  user did not opt in.
+- **Lifecycle** in `steam_api.cpp`: `Overlay().Start()` in init (idempotent), `Overlay().Stop()`
+  in shutdown (unhooks + joins BEFORE the LAN backend it reads is torn down). `PumpOverlay()` in
+  both `SteamAPI_RunCallbacks` and `SteamAPI_ManualDispatch_RunFrame` edge-detects visibility
+  (`ConsumeVisibilityChange`) and delivers `GameOverlayActivated_t` (`m_bUserInitiated` distinguishes
+  the hotkey/window-close from a `ActivateGameOverlay*` call).
+- **Steam methods** (in `gen.py` `BODIES`): `ActivateGameOverlay*` → `emu::Overlay().Show(...)`;
+  `IsOverlayEnabled` → `Available()`; `BOverlayNeedsPresent` → `IsVisible()`.
+- Covered by `test/overlay_test.cpp` (renderer-free: activation → `GameOverlayActivated_t` +
+  `BOverlayNeedsPresent`, plus the compiled-out no-op path). The D3D11/Win32 backends can only be
+  exercised by a real render loop, so they are validated by a live windowed run, not in CI.
 
 ## Reference SDK
 
@@ -226,10 +249,12 @@ with existing setups and the tests):
 | `[http]` `<url> = <status> [body]` | — | Canned `ISteamHTTP` responses (`body` inline or `@file`); longest-URL-prefix match. Lets `https://` endpoints succeed without TLS; unlisted requests fail. |
 | `[net]` `listen_port` | — | Fixed P2P data port; `0` (default) = ephemeral (required for multi-instance-per-host). |
 | `[net]` `discovery_address` / `discovery_port` | — | Multicast discovery group/port. Defaults `239.198.7.4` / `47854`. |
+| `[overlay]` `enabled` | `STEAMEMU_OVERLAY` | Opt-in Dear ImGui game overlay (Windows only). Default off. Backs `ActivateGameOverlay*` / `IsOverlayEnabled` / `GameOverlayActivated_t`. |
+| `[overlay]` `hotkey` | — | In-game toggle chord (mods `shift`/`ctrl`/`alt` + one key). Default `shift+tab`. |
 
 Interface `BODIES` read `emu::Config()` for language/country/DLC; `net.cpp` reads the net
-overrides; `storage.cpp` honors `save_path`. String getters return `const char*` borrowed from
-Config members (stable for process life).
+overrides; `storage.cpp` honors `save_path`; the overlay reads `OverlayEnabled()`/`OverlayHotkey()`.
+String getters return `const char*` borrowed from Config members (stable for process life).
 
 ## Conventions & gotchas
 
@@ -275,6 +300,12 @@ src/net.{h,cpp}       LAN backend: multicast discovery + UDP P2P transport, lobb
 src/storage.{h,cpp}   Local persistence: ISteamRemoteStorage files + ISteamUserStats stats.
 src/services.{h,cpp}  ISteamHTTP (real HTTP client), Music, GameServerStats, Screenshots,
                       HTMLSurface/Timeline handle bookkeeping.
+src/overlay/          Dear ImGui game overlay (Windows; STEAMEMU_ENABLE_OVERLAY).
+  overlay.h             ImGui-free facade (emu::Overlay()); the ONLY overlay header the
+                        generated stubs + steam_api.cpp see.
+  overlay_internal.h    ImGui/Win32-aware shared OverlayImpl state (both backends).
+  Overlay.cpp           separate-window fallback + facade + headless no-op.
+  SwapchainHook.cpp     in-game IDXGISwapChain::Present vtable hook (primary backend).
 test/harness.cpp      Smoke test: identity round-trip over accessor + vtable paths.
 test/api_test.cpp     Behavioral test: flat==vtable, defaults, real callback + auth round-trip.
 test/storage_test.cpp Two-phase test: cloud file + stats/achievement persist across runs.
@@ -289,6 +320,8 @@ test/sockets_test.cpp Two-instance test: ISteamNetworkingSockets connect + messa
 test/async_test.cpp   Call-result completion: CCallResult + plain Callback<T> delivery,
                       FileReadAsync byte round-trip, encrypted-app-ticket pair,
                       StartPurchase-must-fail, ISteamUtils polling path.
+test/overlay_test.cpp Overlay activation: ActivateGameOverlay -> GameOverlayActivated_t +
+                      BOverlayNeedsPresent (renderer-free); inert when compiled out.
 CMakeLists.txt        Build; STEAMWORKS_SDK points at the reference SDK; `regen` target.
 ```
 
@@ -392,13 +425,15 @@ the `ISteamNetworkingUtils` config store round-trips values (the typed helpers f
 Wrong-zero enums audited (`EResult{}` = None ≠ OK; `GetSyncPlatforms` → All; SDR/FakeIP getters
 fail honestly).
 
-Fifteen tests cover it end-to-end (`ctest --test-dir build`): `harness`, `api_test`,
+Sixteen tests cover it end-to-end (`ctest --test-dir build`): `harness`, `api_test`,
 `async_test`, `version_dispatch_test`, `shutdown_test`, `manual_dispatch(+result)_test`,
 `storage_test`, `http_test`, `config_test`, `lan_test`, `lobby_test`, `lobby_rich_test`,
-`leaderboard_test`, `sockets_test`. The only interface
-feature that cannot be made functional here is the overlay / `ISteamHTMLSurface` browser (needs a
-real renderer); real `https://` transport would need a TLS library, but the `[http]` mock section
-covers the common case, so it is only genuine live/streaming HTTPS that remains out of scope.
+`leaderboard_test`, `sockets_test`, `overlay_test`. The **Dear ImGui game overlay is now
+implemented** (`src/overlay/`, Windows-only, opt-in via `[overlay] enabled`) — see "Overlay
+emulation" above; its renderer-free wiring is covered by `overlay_test` and the D3D11/Win32
+backends by a live windowed run. The `ISteamHTMLSurface` browser still needs a real renderer;
+real `https://` transport would need a TLS library, but the `[http]` mock section covers the
+common case, so it is only genuine live/streaming HTTPS that remains out of scope.
 
 This host has only a native 64-bit Linux toolchain, so only `libsteam_api.so` (64-bit) builds
 here. 32-bit (`-m32`, needs multilib) and Windows (`steam_api.dll`/`steam_api64.dll`, via MinGW
@@ -420,8 +455,10 @@ Richer lobbies and leaderboards are now **done**:
 ### Next steps (deepening existing behavior)
 1. Live HTTPS transport in the `ISteamHTTP` client (needs a TLS library) and streaming responses.
    Canned https responses already work via the `[http]` config section (see **Configuration**).
-2. Overlay (Dear ImGui) — optional/late; can't be exercised headless. Backs the
-   `ISteamHTMLSurface` browser and `ActivateGameOverlay*` once a render hook lands.
+2. Overlay (Dear ImGui) — **implemented** (`src/overlay/`, see **Overlay emulation**). Possible
+   deepening: additional present backends (D3D9/10/12, OpenGL, Vulkan — currently D3D11 only),
+   richer panels (invite/join buttons wired back into `ISteamMatchmaking`), and using the same
+   render hook to back the `ISteamHTMLSurface` browser.
 
 Note on the LAN backend design: it uses an eventually-consistent gossip model (each lobby member
 periodically multicasts its presence; the owner's presence carries authoritative lobby data plus
@@ -429,3 +466,21 @@ that member's own per-member data), so there is no join handshake that can fail.
 members time out after a few seconds of silence. Discovery is multicast group `239.198.7.4:47854`
 (overridable via config); P2P data is direct unicast UDP to a peer's beacon-announced port (also
 learned from received datagrams).
+
+Cross-machine discovery — the multicast interface trap: a host has ONE default multicast egress
+interface, and on a multi-adapter box (physical NIC + Hyper-V/WSL/VMware/VPN virtual adapters) it
+is frequently NOT the LAN NIC, so beacons left the machine on the wrong adapter and never reached
+other PCs — while same-host (loopback) discovery still worked, masking the bug. Fix
+(`net.cpp::DiscoverySend` + `LocalIPv4Interfaces`): enumerate every up, non-loopback IPv4 interface
+(`GetAdaptersAddresses` / `getifaddrs`) with its subnet's directed-broadcast address, join the
+group on each, and fan every discovery datagram out over BOTH transports — multicast out each
+interface via `IP_MULTICAST_IF` (plus `IP_MULTICAST_TTL`), AND a directed broadcast to each subnet
+plus the limited broadcast (`SO_BROADCAST`), since some LANs pass broadcast but filter multicast
+(IGMP snooping). The fan-out means the host receives its own datagrams back many times (loopback,
+needed for same-host instances); beacons and lobby gossip are idempotent and drop self-echoes so
+that is harmless, but lobby **chat** appends, so each `ChatMsg` carries a unique `seq` (per-process
+epoch + counter) and the receiver dedups by `(senderID, seq)` — `test/lobby_rich_test.cpp` drops
+~300 duplicate chat copies per run on a 5-interface host and still sees each line exactly once. The
+two-instance LAN tests (`lan_test`, `lobby_test`, `lobby_rich_test`) are now portable
+(`test/lan_spawn.h`: `_spawnl`/`fork`) so they run on Windows too, exercising this path on the
+platform where the trap bites.

@@ -182,13 +182,19 @@ Working: full flat + vtable API surface for 29 interfaces with per-version dispa
 callback / call-result delivery; locally-shimmed auth (fabricated tickets, peers validate
 each other); LAN discovery, P2P, lobbies, and presence; persistent cloud saves, stats,
 achievements, and leaderboards; a real `ISteamHTTP` client (plus `[http]` mocks for
-`https://`); config-driven identity/AppID/DLC/language/country.
+`https://`); config-driven identity/AppID/DLC/language/country; and an opt-in **Dear ImGui
+game overlay** (Windows) that draws over the game via a D3D11 swapchain hook.
+
+The overlay is opt-in — set `[overlay] enabled = 1` in `steamemu.ini` (Windows only) and
+toggle it in-game with the configured hotkey (default `shift+tab`). It shows your identity,
+discovered LAN players and lobbies, and invite/notification toasts, and backs
+`ISteamFriends::ActivateGameOverlay*`, `ISteamUtils::IsOverlayEnabled` /
+`BOverlayNeedsPresent`, and the `GameOverlayActivated_t` pause/resume signal.
 
 Out of scope / limitations:
 
-- **Overlay** (shift-tab, in-game invite UI) — the Dear ImGui overlay needs a live render
-  hook and isn't wired up; interfaces that gate on "is the overlay up?" return sensible
-  values but nothing is drawn.
+- **Overlay backends** — only Direct3D 11 is hooked so far (games on D3D9/10/12, OpenGL or
+  Vulkan fall back to a separate overlay window). Overlay is Windows-only.
 - **Live `https://` transport** — no TLS library; use the `[http]` canned-response section
   for known endpoints. Genuine live/streaming HTTPS is unsupported.
 - Anything requiring Valve's real backend (server-side ticket validation, real matchmaking

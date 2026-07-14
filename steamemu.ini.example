@@ -83,6 +83,20 @@ log_level    = info
 # https://api.example.com/profile  = 200 @responses/profile.json
 # https://telemetry.example.com/   = 204
 
+# ----- Steam overlay --------------------------------------------------------
+# The in-game overlay (a Dear ImGui panel showing your identity, discovered LAN
+# players and lobbies, plus invite/notification toasts). It is OPT-IN because it
+# hooks the game's Direct3D present path: enable it only for games you want it in.
+# Toggle it in-game with the hotkey below (default the real Steam chord Shift+Tab).
+# Windows only; a Linux/headless build has no overlay and these keys are ignored.
+# The STEAMEMU_OVERLAY env var overrides `enabled` (1/true/on = on).
+[overlay]
+# enabled = 0
+# In-game toggle shortcut. Combine modifiers (shift/ctrl/alt) with one key
+# (a letter, a digit, f1-f12, tab, space, esc, enter, home/end/ins/del) using
+# `+`. Examples: shift+tab (default), ctrl+shift+o, f8.
+# hotkey  = shift+tab
+
 # ----- networking (advanced; defaults are fine for most setups) -------------
 [net]
 # Fixed UDP port for the P2P data socket. 0 (the default) picks an ephemeral

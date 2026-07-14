@@ -23,17 +23,21 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <tuple>
 
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>   // GetAdaptersAddresses (enumerate local interfaces)
 using socklen_t = int;
 #define EMU_CLOSESOCKET closesocket
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>    // getifaddrs (enumerate local interfaces)
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -58,6 +62,85 @@ constexpr uint32_t kBeaconMagic = 0x53544d42;  // 'STMB'
 constexpr uint32_t kDataMagic = 0x53544d44;    // 'STMD'
 constexpr uint32_t kLobbyMagic = 0x53544d4c;   // 'STML'
 constexpr uint32_t kChatMagic = 0x53544d43;    // 'STMC' lobby chat
+
+// Enumerate this host's up, non-loopback IPv4 interface addresses (as in_addr
+// s_addr, network byte order). Discovery multicast must be sent out EACH of them
+// and the group joined on EACH of them: a host picks a single default multicast
+// interface otherwise, and on Windows that default is frequently a virtual
+// adapter (Hyper-V/VMware/WSL/VPN) rather than the LAN NIC, so the beacon never
+// reaches other machines even though same-host (loopback) discovery works. This
+// is why cross-machine discovery silently failed. Empty on failure (callers then
+// fall back to the default-interface send, i.e. the previous behavior).
+// A per-process epoch, forming the high 32 bits of outgoing chat message ids so
+// that a peer which restarts (same SteamID) never reuses an id still held in a
+// receiver's dedup window. Nonzero.
+uint32_t ProcessEpoch() {
+	static uint32_t e = [] {
+		auto t = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
+		return t ? t : 1u;
+	}();
+	return e;
+}
+
+// A local interface: its unicast address and its subnet's directed-broadcast
+// address (both network byte order, s_addr). Multicast is sent out `addr` (via
+// IP_MULTICAST_IF); a directed broadcast to `bcast` reaches every host on that
+// subnet and is routed out the owning interface automatically -- belt-and-braces
+// with multicast, since some LANs pass broadcast more reliably (IGMP snooping).
+struct IfaceAddr { uint32_t addr; uint32_t bcast; };
+
+// Directed broadcast from an address + prefix length (host-order math).
+uint32_t BroadcastForPrefix(uint32_t addrNet, unsigned prefix) {
+	if (prefix == 0 || prefix > 32) return INADDR_BROADCAST;
+	uint32_t host = ntohl(addrNet);
+	uint32_t mask = (prefix == 32) ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - prefix));
+	return htonl((host & mask) | ~mask);
+}
+
+std::vector<IfaceAddr> LocalIPv4Interfaces() {
+	std::vector<IfaceAddr> out;
+#if defined(_WIN32)
+	ULONG sz = 15000;
+	std::vector<uint8_t> buf(sz);
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+	ULONG ret = GetAdaptersAddresses(AF_INET, flags, nullptr,
+	                                 reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &sz);
+	if (ret == ERROR_BUFFER_OVERFLOW) {
+		buf.resize(sz);
+		ret = GetAdaptersAddresses(AF_INET, flags, nullptr,
+		                           reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &sz);
+	}
+	if (ret == NO_ERROR) {
+		for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()); a; a = a->Next) {
+			if (a->OperStatus != IfOperStatusUp) continue;
+			if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+			for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+				if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+				uint32_t s = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr.s_addr;
+				if (s && s != htonl(INADDR_LOOPBACK))
+					out.push_back({s, BroadcastForPrefix(s, u->OnLinkPrefixLength)});
+			}
+		}
+	}
+#else
+	struct ifaddrs* ifap = nullptr;
+	if (getifaddrs(&ifap) == 0) {
+		for (auto* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+			if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+			if (!(ifa->ifa_flags & IFF_UP)) continue;
+			if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+			uint32_t s = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr)->sin_addr.s_addr;
+			if (!s || s == htonl(INADDR_LOOPBACK)) continue;
+			uint32_t mask = (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET)
+			              ? reinterpret_cast<sockaddr_in*>(ifa->ifa_netmask)->sin_addr.s_addr : 0;
+			uint32_t bcast = mask ? ((s & mask) | ~mask) : INADDR_BROADCAST;
+			out.push_back({s, bcast});
+		}
+		freeifaddrs(ifap);
+	}
+#endif
+	return out;
+}
 // ISteamNetworkingSockets control/data messages (over the unicast data socket).
 constexpr uint32_t kConnReq = 0x53435271;   // connect request
 constexpr uint32_t kConnAcc = 0x53434163;   // connect accepted
@@ -126,6 +209,13 @@ struct ChatMsg {
 	uint32_t appID;
 	uint64_t lobbyID;
 	uint64_t senderID;
+	// Unique per logical message from this sender (high 32 bits: a per-process
+	// epoch so a restarted peer's ids never collide with retained ones; low 32:
+	// a counter). The receiver dedups by (senderID, seq): DiscoverySend fans one
+	// chat message out every interface, and IP_MULTICAST_LOOP delivers each copy
+	// locally, so without this a single chat line would appear N times. Beacons
+	// and lobby gossip need no such id -- both are idempotent and drop self-echoes.
+	uint64_t seq;
 	uint8_t chatType;
 	uint8_t _pad[3];
 	uint32_t bodyLen;
@@ -177,6 +267,36 @@ struct NetBackend::Impl {
 	SOCKET discoSock = INVALID_SOCKET;
 	SOCKET dataSock = INVALID_SOCKET;
 	uint16_t dataPort = 0;
+
+	// Local interface unicast addresses (for IP_MULTICAST_IF + group joins) and
+	// their subnet directed-broadcast addresses, cached at Start() (see
+	// LocalIPv4Interfaces). discoSendMtx serializes the set-IP_MULTICAST_IF +
+	// sendto sequence in DiscoverySend, since beacons, lobby gossip and chat can
+	// be sent from different threads on discoSock.
+	std::vector<uint32_t> mcastIfaces;
+	std::vector<uint32_t> bcastAddrs;
+	std::mutex discoSendMtx;
+	// Send a discovery-group datagram out every local interface (falling back to
+	// the default interface if enumeration turned up nothing). Used for beacons,
+	// lobby gossip and lobby chat -- everything addressed to the multicast group.
+	void DiscoverySend(const void* data, int len);
+
+	// Outgoing chat id counter (low 32 bits of ChatMsg::seq) and the receiver's
+	// bounded dedup window of (senderID, seq) keys -- drops the N fan-out/loopback
+	// copies of one chat line (see ChatMsg::seq). Guarded by mtx on the read side.
+	std::atomic<uint32_t> chatCounter{0};
+	std::set<std::pair<uint64_t, uint64_t>> seenChat;
+	std::deque<std::pair<uint64_t, uint64_t>> seenChatOrder;
+	bool ChatDuplicate(uint64_t sender, uint64_t seq) {  // call under mtx
+		auto key = std::make_pair(sender, seq);
+		if (!seenChat.insert(key).second) return true;   // already seen
+		seenChatOrder.push_back(key);
+		if (seenChatOrder.size() > 1024) {
+			seenChat.erase(seenChatOrder.front());
+			seenChatOrder.pop_front();
+		}
+		return false;
+	}
 
 	// The pump thread is DETACHED and shares ownership of this Impl (via a
 	// shared_ptr the thread captures), so it is never join()ed -- joining from a
@@ -330,13 +450,34 @@ bool NetBackend::Impl::Start() {
 	if (bind(discoSock, (sockaddr*)&addr, sizeof(addr)) != 0) {
 		EMU_CLOSESOCKET(discoSock); discoSock = INVALID_SOCKET; return false;
 	}
+	// Join the discovery group. The INADDR_ANY join uses the host's default
+	// multicast interface; additionally join on EACH real interface so a
+	// multi-homed host (physical NIC + virtual adapters) receives on the LAN NIC
+	// too, not just whichever the OS picked as default.
+	const uint32_t group = inet_addr(DiscoveryGroup());
 	ip_mreq mreq{};
-	mreq.imr_multiaddr.s_addr = inet_addr(DiscoveryGroup());
+	mreq.imr_multiaddr.s_addr = group;
 	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
 	setsockopt(discoSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq));
+	for (const IfaceAddr& ia : LocalIPv4Interfaces()) {
+		mcastIfaces.push_back(ia.addr);
+		if (ia.bcast && ia.bcast != INADDR_BROADCAST) bcastAddrs.push_back(ia.bcast);
+		ip_mreq m{};
+		m.imr_multiaddr.s_addr = group;
+		m.imr_interface.s_addr = ia.addr;
+		setsockopt(discoSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&m, sizeof(m));  // EADDRINUSE if dup: harmless
+	}
+	EMU_INFO("LAN backend: %d local interface(s) for discovery", (int)mcastIfaces.size());
 	// Receive our own multicast (needed for multiple instances on one host).
 	unsigned char loop = 1;
 	setsockopt(discoSock, IPPROTO_IP, IP_MULTICAST_LOOP, (const char*)&loop, sizeof(loop));
+	// TTL 1 stays on the local subnet, which is all LAN play needs; bump slightly
+	// so a beacon still crosses a single small switch/bridge hop if present.
+	unsigned char ttl = 4;
+	setsockopt(discoSock, IPPROTO_IP, IP_MULTICAST_TTL, (const char*)&ttl, sizeof(ttl));
+	// Also allow directed/limited broadcast: some LANs pass broadcast more
+	// reliably than multicast, so DiscoverySend fans out over both.
+	setsockopt(discoSock, SOL_SOCKET, SO_BROADCAST, (const char*)&yes, sizeof(yes));
 	SetNonBlocking(discoSock);
 
 	// Data socket: ephemeral unicast port, announced in our beacon.
@@ -356,6 +497,40 @@ bool NetBackend::Impl::Start() {
 	return true;
 }
 
+void NetBackend::Impl::DiscoverySend(const void* data, int len) {
+	sockaddr_in to{};
+	to.sin_family = AF_INET;
+	to.sin_port = htons(DiscoveryPort());
+	std::lock_guard<std::mutex> lk(discoSendMtx);
+	if (mcastIfaces.empty()) {
+		// No interfaces enumerated: use the OS default (previous behavior).
+		to.sin_addr.s_addr = inet_addr(DiscoveryGroup());
+		sendto(discoSock, (const char*)data, len, 0, (sockaddr*)&to, sizeof(to));
+		return;
+	}
+	// (1) Multicast out every interface. Set IP_MULTICAST_IF per send so the
+	// packet egresses the LAN NIC(s), not just the OS default. A same-host second
+	// instance still receives via IP_MULTICAST_LOOP.
+	const uint32_t group = inet_addr(DiscoveryGroup());
+	for (uint32_t ifAddr : mcastIfaces) {
+		in_addr ia{};
+		ia.s_addr = ifAddr;
+		setsockopt(discoSock, IPPROTO_IP, IP_MULTICAST_IF, (const char*)&ia, sizeof(ia));
+		to.sin_addr.s_addr = group;
+		sendto(discoSock, (const char*)data, len, 0, (sockaddr*)&to, sizeof(to));
+	}
+	// (2) Directed broadcast to each subnet (routed out the owning interface),
+	// plus the limited broadcast, for LANs that pass broadcast but filter
+	// multicast. Duplicate arrivals are harmless: beacons/lobby gossip are
+	// idempotent and drop self-echoes; chat is de-duplicated by (sender, seq).
+	for (uint32_t bcast : bcastAddrs) {
+		to.sin_addr.s_addr = bcast;
+		sendto(discoSock, (const char*)data, len, 0, (sockaddr*)&to, sizeof(to));
+	}
+	to.sin_addr.s_addr = INADDR_BROADCAST;
+	sendto(discoSock, (const char*)data, len, 0, (sockaddr*)&to, sizeof(to));
+}
+
 void NetBackend::Impl::SendBeacon() {
 	Beacon b{};
 	b.magic = kBeaconMagic;
@@ -363,11 +538,7 @@ void NetBackend::Impl::SendBeacon() {
 	b.appID = AppID();
 	b.dataPort = dataPort;
 	std::snprintf(b.name, sizeof(b.name), "%s", PersonaName());
-	sockaddr_in to{};
-	to.sin_family = AF_INET;
-	to.sin_addr.s_addr = inet_addr(DiscoveryGroup());
-	to.sin_port = htons(DiscoveryPort());
-	sendto(discoSock, (const char*)&b, sizeof(b), 0, (sockaddr*)&to, sizeof(to));
+	DiscoverySend(&b, sizeof(b));
 }
 
 void NetBackend::Impl::HandleBeacon(const Beacon& b, const sockaddr_in& from) {
@@ -460,15 +631,11 @@ void NetBackend::Impl::SendLobbyPresence() {
 			msgs.push_back(std::move(o));
 		}
 	}
-	sockaddr_in to{};
-	to.sin_family = AF_INET;
-	to.sin_addr.s_addr = inet_addr(DiscoveryGroup());
-	to.sin_port = htons(DiscoveryPort());
 	for (auto& o : msgs) {
 		std::vector<uint8_t> buf(sizeof(LobbyMsg) + o.blob.size());
 		std::memcpy(buf.data(), &o.hdr, sizeof(LobbyMsg));
 		if (!o.blob.empty()) std::memcpy(buf.data() + sizeof(LobbyMsg), o.blob.data(), o.blob.size());
-		sendto(discoSock, (const char*)buf.data(), (int)buf.size(), 0, (sockaddr*)&to, sizeof(to));
+		DiscoverySend(buf.data(), (int)buf.size());
 	}
 }
 
@@ -571,6 +738,13 @@ void NetBackend::Impl::HandleChatMsg(const uint8_t* buf, int len) {
 		std::lock_guard<std::mutex> lk(mtx);
 		auto it = lobbies.find(m.lobbyID);
 		if (it == lobbies.end() || !it->second.joined) return;  // not our lobby
+		// Drop the extra fan-out / loopback copies of this chat line (see
+		// ChatMsg::seq); only the first (senderID, seq) is appended and reported.
+		if (ChatDuplicate(m.senderID, m.seq)) {
+			EMU_DEBUG("net: dropped duplicate chat copy (sender %llu seq %llu)",
+			          (unsigned long long)m.senderID, (unsigned long long)m.seq);
+			return;
+		}
 		weAreIn = true;
 		ChatEntry e;
 		e.sender = m.senderID;
@@ -1122,20 +1296,16 @@ bool NetBackend::SendLobbyChatMsg(CSteamID lobby, const void* body, int cb) {
 	h.appID = AppID();
 	h.lobbyID = lobby.ConvertToUint64();
 	h.senderID = LocalSteamID().ConvertToUint64();
+	h.seq = ((uint64_t)ProcessEpoch() << 32) | (uint64_t)(++m_impl->chatCounter);
 	h.chatType = (uint8_t)k_EChatEntryTypeChatMsg;
 	h.bodyLen = (uint32_t)cb;
 	std::vector<uint8_t> buf(sizeof(ChatMsg) + (size_t)cb);
 	std::memcpy(buf.data(), &h, sizeof(ChatMsg));
 	if (cb) std::memcpy(buf.data() + sizeof(ChatMsg), body, (size_t)cb);
-	sockaddr_in to{};
-	to.sin_family = AF_INET;
-	to.sin_addr.s_addr = inet_addr(DiscoveryGroup());
-	to.sin_port = htons(DiscoveryPort());
-	// Multicast; our own loopback copy delivers the message to us too, so the
-	// local user gets its LobbyChatMsg_t just like every other member.
-	int r = sendto(m_impl->discoSock, (const char*)buf.data(), (int)buf.size(), 0,
-	               (sockaddr*)&to, sizeof(to));
-	return r == (int)buf.size();
+	// Multicast out every interface; our own loopback copy delivers the message
+	// to us too, so the local user gets its LobbyChatMsg_t like every other member.
+	m_impl->DiscoverySend(buf.data(), (int)buf.size());
+	return true;
 }
 
 int NetBackend::GetLobbyChatEntry(CSteamID lobby, int iChatID, CSteamID* user,

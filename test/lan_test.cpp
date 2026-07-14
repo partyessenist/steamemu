@@ -7,7 +7,9 @@
 //   2. send it a P2P packet through ISteamNetworking, and
 //   3. receive the peer's packet and verify the sender + payload.
 // Both children exiting 0 proves discovery + transport end-to-end on one host
-// (multicast loopback). On a real LAN the same code reaches other machines.
+// (multicast loopback, out every local interface). On a real LAN the same code
+// reaches other machines -- the beacon is fanned out over every interface, so a
+// multi-homed host (physical NIC + virtual adapters) still reaches the LAN NIC.
 //
 // Phase 2 (the listen-server shape): the "server"
 // child also runs a game server and serves P2P through SteamGameServerNetworking
@@ -16,7 +18,8 @@
 // FROM that id -- games filter server traffic by sender. The server also proves
 // the client/server inboxes don't leak into each other.
 //
-// POSIX-only (fork/exec); this host is Linux.
+// Portable: the child logic uses only the Steam API; the parent spawns two
+// copies of itself (CreateProcess/_spawn on Windows, fork/exec on POSIX).
 //============================================================================
 #include <algorithm>
 #include <cstdio>
@@ -26,8 +29,7 @@
 #include <string>
 #include <thread>
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include "lan_spawn.h"
 
 #include "steam/steam_api.h"
 #include "steam/steam_gameserver.h"
@@ -165,31 +167,12 @@ int main(int argc, char** argv) {
 		return run_child(false);
 
 	// Parent: spawn two children with distinct identities, same AppID.
-	setenv("SteamAppId", "480", 1);
-	struct { const char* role; const char* id; const char* name; } cfg[2] = {
+	LAN_SETENV("SteamAppId", "480");
+	const LanChild children[2] = {
 		{"server", "1000001", "Alice"}, {"client", "1000002", "Bob"},
 	};
-	pid_t pids[2];
-	for (int i = 0; i < 2; ++i) {
-		pid_t pid = fork();
-		if (pid == 0) {
-			setenv("STEAMEMU_STEAMID", cfg[i].id, 1);
-			setenv("STEAMEMU_NAME", cfg[i].name, 1);
-			execl(argv[0], argv[0], cfg[i].role, (char*)nullptr);
-			perror("execl");
-			_exit(127);
-		}
-		pids[i] = pid;
-	}
+	int rc = LanRunTwoChildren(argv[0], children);
 
-	int rc = 0;
-	for (int i = 0; i < 2; ++i) {
-		int status = 0;
-		waitpid(pids[i], &status, 0);
-		int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-		printf("child %d (%s) exit=%d\n", i, cfg[i].name, code);
-		if (code != 0) rc = 1;
-	}
 	if (rc == 0) printf("PASS: lan_test peers discovered and exchanged packets\n");
 	else printf("FAILED: lan_test\n");
 	return rc;

@@ -71,6 +71,16 @@ std::string Lower(std::string s) {
 	return s;
 }
 
+// Parse a boolean-ish config/env value. true for 1/true/yes/on (case-insensitive);
+// anything else (including empty) falls back to def.
+bool ParseBool(const std::string& s, bool def) {
+	if (s.empty()) return def;
+	std::string v = Lower(Trim(s));
+	if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+	if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+	return def;
+}
+
 // Read a whole file into a byte vector. Returns false if it can't be opened.
 bool ReadFile(const std::string& path, std::vector<uint8_t>& out) {
 	FILE* f = std::fopen(path.c_str(), "rb");
@@ -264,6 +274,14 @@ void ConfigData::Resolve() {
 	if (m_discoveryAddr.empty()) m_discoveryAddr = "239.198.7.4";
 	std::string dp = net("discovery_port");
 	m_discoveryPort = dp.empty() ? (uint16_t)47854 : (uint16_t)std::strtoul(dp.c_str(), nullptr, 10);
+
+	// -- overlay ([overlay] section). Opt-in because it hooks the game's render
+	// loop; STEAMEMU_OVERLAY env wins so tests/automation can force it on.
+	std::string oe = Env("STEAMEMU_OVERLAY");
+	if (oe.empty()) oe = GetRaw("overlay", "enabled");
+	m_overlayEnabled = ParseBool(oe, false);
+	m_overlayHotkey = GetRaw("overlay", "hotkey");
+	if (m_overlayHotkey.empty()) m_overlayHotkey = "shift+tab";
 }
 
 bool ConfigData::HasDLC(uint32_t appID) const {

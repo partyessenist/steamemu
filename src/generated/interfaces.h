@@ -8,6 +8,7 @@
 #include "net.h"
 #include "storage.h"
 #include "services.h"
+#include "overlay/overlay.h"
 #include <cstdio>
 #include <cstring>
 #include "steam/isteamapps.h"
@@ -180,12 +181,12 @@ public:
 	CSteamID GetFriendFromSourceByIndex(CSteamID steamIDSource, int iFriend) override { EMU_LOG("ISteamFriends::GetFriendFromSourceByIndex"); return {};  }
 	bool IsUserInSource(CSteamID steamIDUser, CSteamID steamIDSource) override { EMU_LOG("ISteamFriends::IsUserInSource"); return {};  }
 	void SetInGameVoiceSpeaking(CSteamID steamIDUser, bool bSpeaking) override { EMU_LOG("ISteamFriends::SetInGameVoiceSpeaking"); }
-	void ActivateGameOverlay(const char * pchDialog) override { EMU_LOG("ISteamFriends::ActivateGameOverlay"); }
-	void ActivateGameOverlayToUser(const char * pchDialog, CSteamID steamID) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToUser"); }
-	void ActivateGameOverlayToWebPage(const char * pchURL, EActivateGameOverlayToWebPageMode eMode) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToWebPage"); }
-	void ActivateGameOverlayToStore(AppId_t nAppID, EOverlayToStoreFlag eFlag) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToStore"); }
+	void ActivateGameOverlay(const char * pchDialog) override { EMU_LOG("ISteamFriends::ActivateGameOverlay"); emu::Overlay().Show(pchDialog); }
+	void ActivateGameOverlayToUser(const char * pchDialog, CSteamID steamID) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToUser"); (void)steamID; emu::Overlay().Show(pchDialog); }
+	void ActivateGameOverlayToWebPage(const char * pchURL, EActivateGameOverlayToWebPageMode eMode) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToWebPage"); (void)eMode; emu::Overlay().Show(pchURL); }
+	void ActivateGameOverlayToStore(AppId_t nAppID, EOverlayToStoreFlag eFlag) override { EMU_LOG("ISteamFriends::ActivateGameOverlayToStore"); (void)nAppID; (void)eFlag; emu::Overlay().Show("store"); }
 	void SetPlayedWith(CSteamID steamIDUserPlayedWith) override { EMU_LOG("ISteamFriends::SetPlayedWith"); }
-	void ActivateGameOverlayInviteDialog(CSteamID steamIDLobby) override { EMU_LOG("ISteamFriends::ActivateGameOverlayInviteDialog"); }
+	void ActivateGameOverlayInviteDialog(CSteamID steamIDLobby) override { EMU_LOG("ISteamFriends::ActivateGameOverlayInviteDialog"); (void)steamIDLobby; emu::Overlay().Show("invite"); }
 	int GetSmallFriendAvatar(CSteamID steamIDFriend) override { EMU_LOG("ISteamFriends::GetSmallFriendAvatar"); return emu::AvatarImageHandle(steamIDFriend, 0); }
 	int GetMediumFriendAvatar(CSteamID steamIDFriend) override { EMU_LOG("ISteamFriends::GetMediumFriendAvatar"); return emu::AvatarImageHandle(steamIDFriend, 1); }
 	int GetLargeFriendAvatar(CSteamID steamIDFriend) override { EMU_LOG("ISteamFriends::GetLargeFriendAvatar"); return emu::AvatarImageHandle(steamIDFriend, 2); }
@@ -224,9 +225,9 @@ public:
 	bool IsClanPublic(CSteamID steamIDClan) override { EMU_LOG("ISteamFriends::IsClanPublic"); return {};  }
 	bool IsClanOfficialGameGroup(CSteamID steamIDClan) override { EMU_LOG("ISteamFriends::IsClanOfficialGameGroup"); return {};  }
 	int GetNumChatsWithUnreadPriorityMessages() override { EMU_LOG("ISteamFriends::GetNumChatsWithUnreadPriorityMessages"); return {};  }
-	void ActivateGameOverlayRemotePlayTogetherInviteDialog(CSteamID steamIDLobby) override { EMU_LOG("ISteamFriends::ActivateGameOverlayRemotePlayTogetherInviteDialog"); }
+	void ActivateGameOverlayRemotePlayTogetherInviteDialog(CSteamID steamIDLobby) override { EMU_LOG("ISteamFriends::ActivateGameOverlayRemotePlayTogetherInviteDialog"); (void)steamIDLobby; emu::Overlay().Show("invite"); }
 	bool RegisterProtocolInOverlayBrowser(const char * pchProtocol) override { EMU_LOG("ISteamFriends::RegisterProtocolInOverlayBrowser"); return {};  }
-	void ActivateGameOverlayInviteDialogConnectString(const char * pchConnectString) override { EMU_LOG("ISteamFriends::ActivateGameOverlayInviteDialogConnectString"); }
+	void ActivateGameOverlayInviteDialogConnectString(const char * pchConnectString) override { EMU_LOG("ISteamFriends::ActivateGameOverlayInviteDialogConnectString"); emu::Overlay().Show(pchConnectString); }
 	SteamAPICall_t RequestEquippedProfileItems(CSteamID steamID) override { EMU_LOG("ISteamFriends::RequestEquippedProfileItems"); EquippedProfileItems_t r{}; r.m_eResult = k_EResultOK; return emu::QueueCallResult(r);  }
 	bool BHasEquippedProfileItem(CSteamID steamID, ECommunityProfileItemType itemType) override { EMU_LOG("ISteamFriends::BHasEquippedProfileItem"); return {};  }
 	const char * GetProfileItemPropertyString(CSteamID steamID, ECommunityProfileItemType itemType, ECommunityProfileItemProperty prop) override { EMU_LOG("ISteamFriends::GetProfileItemPropertyString"); return "";  }
@@ -260,8 +261,8 @@ public:
 	bool GetAPICallResult(SteamAPICall_t hSteamAPICall, void * pCallback, int cubCallback, int iCallbackExpected, bool * pbFailed) override { EMU_LOG("ISteamUtils::GetAPICallResult"); return emu::Dispatch().GetAPICallResult(hSteamAPICall, pCallback, cubCallback, iCallbackExpected, pbFailed); }
 	uint32 GetIPCCallCount() override { EMU_LOG("ISteamUtils::GetIPCCallCount"); return {};  }
 	void SetWarningMessageHook(SteamAPIWarningMessageHook_t pFunction) override { EMU_LOG("ISteamUtils::SetWarningMessageHook"); }
-	bool IsOverlayEnabled() override { EMU_LOG("ISteamUtils::IsOverlayEnabled"); return false; }
-	bool BOverlayNeedsPresent() override { EMU_LOG("ISteamUtils::BOverlayNeedsPresent"); return false; }
+	bool IsOverlayEnabled() override { EMU_LOG("ISteamUtils::IsOverlayEnabled"); return emu::Overlay().Available(); }
+	bool BOverlayNeedsPresent() override { EMU_LOG("ISteamUtils::BOverlayNeedsPresent"); return emu::Overlay().IsVisible(); }
 	SteamAPICall_t CheckFileSignature(const char * szFileName) override { EMU_LOG("ISteamUtils::CheckFileSignature"); CheckFileSignature_t r{}; r.m_eCheckFileSignature = k_ECheckFileSignatureValidSignature; return emu::QueueCallResult(r); }
 	bool ShowGamepadTextInput(EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, const char * pchDescription, uint32 unCharMax, const char * pchExistingText) override { EMU_LOG("ISteamUtils::ShowGamepadTextInput"); return {};  }
 	uint32 GetEnteredGamepadTextLength() override { EMU_LOG("ISteamUtils::GetEnteredGamepadTextLength"); return {};  }

@@ -1,3 +1,6 @@
 [submodule "third_party/SteamworksSDK"]
 	path = third_party/SteamworksSDK
 	url = https://github.com/rlabrecque/SteamworksSDK
+[submodule "third_party/imgui"]
+	path = third_party/imgui
+	url = https://github.com/ocornut/imgui.git

@@ -18,8 +18,7 @@
 #include <chrono>
 #include <thread>
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include "lan_spawn.h"
 
 #include "steam/steam_api.h"
 
@@ -135,30 +134,11 @@ int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "owner") == 0) return run_owner();
 	if (argc > 1 && std::strcmp(argv[1], "joiner") == 0) return run_joiner();
 
-	setenv("SteamAppId", "481", 1);
-	struct { const char* role; const char* id; const char* name; } cfg[2] = {
+	LAN_SETENV("SteamAppId", "481");
+	const LanChild children[2] = {
 		{"owner", "2000001", "Host"}, {"joiner", "2000002", "Guest"},
 	};
-	pid_t pids[2];
-	for (int i = 0; i < 2; ++i) {
-		pid_t pid = fork();
-		if (pid == 0) {
-			setenv("STEAMEMU_STEAMID", cfg[i].id, 1);
-			setenv("STEAMEMU_NAME", cfg[i].name, 1);
-			execl(argv[0], argv[0], cfg[i].role, (char*)nullptr);
-			perror("execl");
-			_exit(127);
-		}
-		pids[i] = pid;
-	}
-	int rc = 0;
-	for (int i = 0; i < 2; ++i) {
-		int status = 0;
-		waitpid(pids[i], &status, 0);
-		int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-		printf("%s exit=%d\n", cfg[i].role, code);
-		if (code != 0) rc = 1;
-	}
+	int rc = LanRunTwoChildren(argv[0], children);
 	if (rc == 0) printf("PASS: lobby_test create/join/data-sync worked\n");
 	else printf("FAILED: lobby_test\n");
 	return rc;

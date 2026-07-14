@@ -19,6 +19,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)   # only S_API-marked symbols are exported
 
 # ---------------------------------------------------------------------------
+# The Dear ImGui game overlay (shift-tab friends/lobby panel, invite/notify
+# toasts). It hooks the game's D3D11 present path (Windows-only) and stands up
+# its own Win32 window as a fallback, so it builds only on Windows; a headless /
+# Linux build compiles the overlay's inert no-op path instead and the emulated
+# ISteamFriends::ActivateGameOverlay* / ISteamUtils::IsOverlayEnabled methods
+# degrade to "no overlay present". Compile-time gate; the runtime gate is the
+# opt-in [overlay] enabled key in steamemu.ini. See src/overlay/.
+# ---------------------------------------------------------------------------
+option(STEAMEMU_ENABLE_OVERLAY "Build the Dear ImGui game overlay (Windows only)" ON)
+if(NOT WIN32)
+  set(STEAMEMU_ENABLE_OVERLAY OFF)
+endif()
+
+# ---------------------------------------------------------------------------
 # The emulator library. Loaded by a game in place of the real steam_api.
 #   Windows: steam_api.dll (32-bit) / steam_api64.dll (64-bit)
 #   Linux:   libsteam_api.so
@@ -39,7 +53,9 @@ add_library(steam_api SHARED
     src/generated/registry.cpp
     src/generated/flat_api.cpp
     src/compat_flat.cpp
-    src/compat_init.cpp)
+    src/compat_init.cpp
+    src/overlay/Overlay.cpp
+    src/overlay/SwapchainHook.cpp)
 
 target_include_directories(steam_api PRIVATE ${SDK_INCLUDE} src)
 target_compile_definitions(steam_api PRIVATE STEAM_API_EXPORTS)
@@ -47,9 +63,47 @@ find_package(Threads REQUIRED)
 target_link_libraries(steam_api PRIVATE Threads::Threads)
 
 # The LAN backend (net.cpp) uses Winsock2 on Windows; link the import library so
-# socket/bind/select/WSAStartup resolve. (POSIX has these in libc.)
+# socket/bind/select/WSAStartup resolve. (POSIX has these in libc.) iphlpapi
+# provides GetAdaptersAddresses, used to fan discovery multicast out every local
+# interface (cross-machine discovery).
 if(WIN32)
-  target_link_libraries(steam_api PRIVATE ws2_32)
+  target_link_libraries(steam_api PRIVATE ws2_32 iphlpapi)
+endif()
+
+# ---------------------------------------------------------------------------
+# Dear ImGui overlay. Vendored under third_party/imgui (a git submodule pinned
+# to v1.90.9-docking). Built as a separate static library so ImGui's own
+# warnings never trip our warning flags, then linked into the DLL where its
+# symbols stay internal (only S_API functions are exported). Only the overlay
+# TUs include ImGui; no exported signature or generated stub TU may. The overlay
+# facade (src/overlay/overlay.h) is ImGui-free, so the emulator links against it
+# unconditionally -- when the overlay is compiled out it is an inert no-op.
+# ---------------------------------------------------------------------------
+if(STEAMEMU_ENABLE_OVERLAY)
+  set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+  if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp")
+    message(FATAL_ERROR
+        "STEAMEMU_ENABLE_OVERLAY is ON but ImGui is not vendored at ${IMGUI_DIR}. "
+        "Run: git submodule update --init third_party/imgui")
+  endif()
+  add_library(steamemu_imgui STATIC
+      "${IMGUI_DIR}/imgui.cpp"
+      "${IMGUI_DIR}/imgui_draw.cpp"
+      "${IMGUI_DIR}/imgui_tables.cpp"
+      "${IMGUI_DIR}/imgui_widgets.cpp"
+      "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
+      "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp")
+  target_include_directories(steamemu_imgui PUBLIC "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
+  set_target_properties(steamemu_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(MSVC)
+    target_compile_options(steamemu_imgui PRIVATE /W0)
+  else()
+    target_compile_options(steamemu_imgui PRIVATE -w)
+  endif()
+
+  target_link_libraries(steam_api PRIVATE steamemu_imgui d3d11 dxgi d3dcompiler dwmapi)
+  target_include_directories(steam_api PRIVATE "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
+  target_compile_definitions(steam_api PRIVATE STEAMEMU_ENABLE_OVERLAY=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -105,6 +159,53 @@ target_link_libraries(version_dispatch_test PRIVATE steam_api)
 add_test(NAME version_dispatch COMMAND version_dispatch_test)
 set_tests_properties(version_dispatch PROPERTIES
     PASS_REGULAR_EXPRESSION "PASS: version_dispatch all checks passed")
+
+# Overlay activation -> GameOverlayActivated_t + BOverlayNeedsPresent. Portable:
+# drives the overlay through the Steam API without a renderer (the D3D11/Win32
+# backends are exercised by a live run). STEAMEMU_OVERLAY_BUILT tells the test
+# whether to expect the active or the inert (compiled-out) behavior.
+add_executable(overlay_test test/overlay_test.cpp)
+target_include_directories(overlay_test PRIVATE ${SDK_INCLUDE})
+target_link_libraries(overlay_test PRIVATE steam_api)
+if(STEAMEMU_ENABLE_OVERLAY)
+  target_compile_definitions(overlay_test PRIVATE STEAMEMU_OVERLAY_BUILT=1)
+endif()
+add_test(NAME overlay_activation COMMAND overlay_test)
+set_tests_properties(overlay_activation PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS: overlay_test all checks passed"
+    TIMEOUT 20)
+
+# Two-instance LAN discovery + P2P (portable: spawns two copies of itself). It
+# exercises the multicast beacon fanned out over every local interface -- the
+# path that made cross-machine discovery work. Same-host here (loopback); a real
+# LAN reaches other machines with the same code.
+add_executable(lan_test test/lan_test.cpp)
+target_include_directories(lan_test PRIVATE ${SDK_INCLUDE})
+target_link_libraries(lan_test PRIVATE steam_api)
+add_test(NAME lan_discovery COMMAND lan_test)
+set_tests_properties(lan_discovery PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS: lan_test peers discovered"
+    TIMEOUT 40)
+
+# Two-instance lobby create/join/data-sync, and the rich variant (member-data,
+# chat, filters). Portable (test/lan_spawn.h). These exercise lobby gossip and
+# chat over the discovery multicast -- including chat de-duplication now that the
+# beacon is fanned out over every interface.
+add_executable(lobby_test test/lobby_test.cpp)
+target_include_directories(lobby_test PRIVATE ${SDK_INCLUDE})
+target_link_libraries(lobby_test PRIVATE steam_api)
+add_test(NAME lan_lobbies COMMAND lobby_test)
+set_tests_properties(lan_lobbies PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS: lobby_test create/join/data-sync worked"
+    TIMEOUT 40)
+
+add_executable(lobby_rich_test test/lobby_rich_test.cpp)
+target_include_directories(lobby_rich_test PRIVATE ${SDK_INCLUDE})
+target_link_libraries(lobby_rich_test PRIVATE steam_api)
+add_test(NAME lan_lobbies_rich COMMAND lobby_rich_test)
+set_tests_properties(lan_lobbies_rich PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS: lobby_rich_test member-data/chat/filters/request worked"
+    TIMEOUT 45)
 
 # Portable (no fork/sockets): guards clean shutdown + re-init on every platform.
 # The TIMEOUT makes a shutdown hang (the bug this covers) a failure.
@@ -162,22 +263,6 @@ if(NOT WIN32)
   set_tests_properties(config_file PROPERTIES
       PASS_REGULAR_EXPRESSION "PASS: config_test all checks passed")
 
-  add_executable(lan_test test/lan_test.cpp)
-  target_include_directories(lan_test PRIVATE ${SDK_INCLUDE})
-  target_link_libraries(lan_test PRIVATE steam_api)
-  add_test(NAME lan_discovery COMMAND lan_test)
-  set_tests_properties(lan_discovery PROPERTIES
-      PASS_REGULAR_EXPRESSION "PASS: lan_test peers discovered"
-      TIMEOUT 40)
-
-  add_executable(lobby_test test/lobby_test.cpp)
-  target_include_directories(lobby_test PRIVATE ${SDK_INCLUDE})
-  target_link_libraries(lobby_test PRIVATE steam_api)
-  add_test(NAME lan_lobbies COMMAND lobby_test)
-  set_tests_properties(lan_lobbies PROPERTIES
-      PASS_REGULAR_EXPRESSION "PASS: lobby_test create/join/data-sync worked"
-      TIMEOUT 40)
-
   add_executable(sockets_test test/sockets_test.cpp)
   target_include_directories(sockets_test PRIVATE ${SDK_INCLUDE})
   target_link_libraries(sockets_test PRIVATE steam_api)
@@ -193,12 +278,4 @@ if(NOT WIN32)
   set_tests_properties(leaderboards PROPERTIES
       PASS_REGULAR_EXPRESSION "PASS: leaderboard_test upload/rank/persist worked"
       TIMEOUT 30)
-
-  add_executable(lobby_rich_test test/lobby_rich_test.cpp)
-  target_include_directories(lobby_rich_test PRIVATE ${SDK_INCLUDE})
-  target_link_libraries(lobby_rich_test PRIVATE steam_api)
-  add_test(NAME lan_lobbies_rich COMMAND lobby_rich_test)
-  set_tests_properties(lan_lobbies_rich PROPERTIES
-      PASS_REGULAR_EXPRESSION "PASS: lobby_rich_test member-data/chat/filters/request worked"
-      TIMEOUT 45)
 endif()

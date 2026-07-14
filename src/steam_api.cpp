@@ -15,6 +15,7 @@
 #include "config.h"
 #include "dispatch.h"
 #include "net.h"
+#include "overlay/overlay.h"
 #include "generated/registry.h"
 
 #include "steam/isteamuser.h"  // SteamServersConnected_t
@@ -51,6 +52,27 @@ void AnnounceSteamConnection() {
 	}
 }
 
+// Reconcile overlay visibility into GameOverlayActivated_t. The overlay's
+// visibility changes on another thread (the toggle hotkey, a window close) or in
+// a Steam call (ActivateGameOverlay* -> Show); either way the game learns of it
+// only through this callback, which many games use to pause/resume. Drained from
+// both pump paths so it works with CCallback and manual dispatch alike. No-op
+// when the overlay is compiled out / not enabled (ConsumeVisibilityChange is
+// then always false).
+void PumpOverlay() {
+	bool visible = false, userInitiated = false;
+	while (emu::Overlay().ConsumeVisibilityChange(visible, userInitiated)) {
+		GameOverlayActivated_t ev{};
+		ev.m_bActive = visible ? 1 : 0;
+		ev.m_bUserInitiated = userInitiated;
+		ev.m_nAppID = emu::AppID();
+		ev.m_dwOverlayPID = 0;
+		emu::QueueCallback(ev);
+		EMU_INFO("overlay: %s (%s)", visible ? "shown" : "hidden",
+		         userInitiated ? "user" : "game");
+	}
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -81,6 +103,10 @@ S_API ESteamAPIInitResult S_CALLTYPE SteamInternal_SteamAPI_Init(
 	// beacons yet and finds nothing. Starting here means both hosts and browsers are
 	// discovering peers/lobbies for the whole time the player sits in the menu.
 	emu::Net().EnsureStarted();
+	// Bring up the Dear ImGui overlay if the user opted in ([overlay] enabled).
+	// Idempotent, so a game that re-inits (or inits both client + gameserver in
+	// one process) does not start it twice.
+	emu::Overlay().Start();
 	return k_ESteamAPIInitResult_OK;
 }
 
@@ -96,6 +122,10 @@ S_API bool S_CALLTYPE SteamAPI_InitSafe() {
 
 S_API void S_CALLTYPE SteamAPI_Shutdown() {
 	EMU_INFO("SteamAPI shutdown");
+	// Tear down the overlay first: it unhooks the game's Present (so the game's
+	// render thread stops entering our code) and joins its render thread before
+	// the state it reads (peers, identity) is torn down below.
+	emu::Overlay().Stop();
 	// Tear down the LAN backend's pump thread + sockets. Without this the thread
 	// keeps running after the game thinks Steam is gone; once the sockets are
 	// torn down at process exit its select() loop spins at 100% CPU and the
@@ -226,6 +256,7 @@ S_API void *S_CALLTYPE SteamInternal_FindOrCreateGameServerInterface(HSteamUser,
 S_API void S_CALLTYPE SteamAPI_RunCallbacks() {
 	EMU_LOG("SteamAPI_RunCallbacks");
 	AnnounceSteamConnection();   // synthesize the Steam logon
+	PumpOverlay();               // deliver GameOverlayActivated_t on visibility changes
 	emu::Dispatch().RunCallbacks(false);
 }
 S_API void S_CALLTYPE SteamGameServer_RunCallbacks() {
@@ -262,6 +293,7 @@ S_API void S_CALLTYPE SteamAPI_ManualDispatch_RunFrame(HSteamPipe) {
 	// Manual dispatch is the other pump: the game then drains callbacks via
 	// GetNextCallback. Announce the Steam logon here too so it is delivered.
 	AnnounceSteamConnection();
+	PumpOverlay();   // deliver GameOverlayActivated_t on visibility changes
 }
 S_API bool S_CALLTYPE SteamAPI_ManualDispatch_GetNextCallback(HSteamPipe hPipe, CallbackMsg_t *pMsg) {
 	EMU_LOG("SteamAPI_ManualDispatch_GetNextCallback");
