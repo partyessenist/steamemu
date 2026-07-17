@@ -1,0 +1,105 @@
+name: Release
+
+# Cut a GitHub Release from the built artifacts -- NEVER on ordinary commits.
+# Trigger: push an annotated SemVer tag.
+#   git tag -a v0.1.0 -m "steamemu 0.1.0"
+#   git push origin v0.1.0
+# Each target is built and its tests run; only if all pass is the Release
+# published with the packaged libraries attached.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # needed to create the Release and upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true   # a broken target must block the whole release
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            cmake_args: ""
+            lib: build/libsteam_api.so
+          - name: windows-x64
+            os: windows-latest
+            cmake_args: "-A x64"
+            lib: build/Release/steam_api64.dll
+          - name: windows-x86
+            os: windows-latest
+            cmake_args: "-A Win32"
+            lib: build/Release/steam_api.dll
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          stage="steamemu-${version}-${{ matrix.name }}"
+          mkdir -p "dist/${stage}"
+          cp "${{ matrix.lib }}" "dist/${stage}/"
+          cp steamemu.ini.example README.md VERSION "dist/${stage}/"
+          tar -czf "dist/${stage}.tar.gz" -C dist "${stage}"
+
+      - name: Stage package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          stage="steamemu-${version}-${{ matrix.name }}"
+          mkdir -p "dist/${stage}"
+          cp "${{ matrix.lib }}" "dist/${stage}/"
+          cp steamemu.ini.example README.md VERSION "dist/${stage}/"
+          powershell -Command "Compress-Archive -Path 'dist/${stage}/*' -DestinationPath 'dist/${stage}.zip'"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: steamemu ${{ github.ref_name }}
+          # Mark <1.0.0 tags as pre-releases automatically.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip

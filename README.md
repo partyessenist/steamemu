@@ -1,5 +1,8 @@
 # steamemu
 
+[![CI](https://github.com/partyessenist/steamemu/actions/workflows/ci.yml/badge.svg)](https://github.com/partyessenist/steamemu/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/partyessenist/steamemu?include_prereleases&sort=semver)](https://github.com/partyessenist/steamemu/releases/latest)
+
 A drop-in reimplementation of Valve's Steamworks API. It builds to a library that a game
 loads **instead of** the real one — `steam_api.dll` / `steam_api64.dll` on Windows,
 `libsteam_api.so` on Linux — and satisfies the Steam API surface the game links against, so

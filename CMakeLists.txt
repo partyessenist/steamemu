@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.15)
-project(steamemu LANGUAGES CXX)
+project(steamemu VERSION 0.1.0 LANGUAGES CXX)
+
+# ---------------------------------------------------------------------------
+# Version: SemVer, single source of truth is the project() line above (mirrored
+# in the VERSION file for release tooling). Releases are cut from an annotated
+# git tag `vMAJOR.MINOR.PATCH` (see .github/workflows/release.yml); the tag is
+# authoritative for the published artifacts, this number for local builds.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Reference Steamworks SDK (headers are ground truth; treated as read-only).
