@@ -163,6 +163,18 @@ set_tests_properties(async_callresults PROPERTIES
 add_executable(version_dispatch_test test/version_dispatch_test.cpp)
 target_include_directories(version_dispatch_test PRIVATE ${SDK_INCLUDE})
 target_link_libraries(version_dispatch_test PRIVATE steam_api)
+# This test deliberately reinterpret_casts real objects to locally-declared
+# abstract structs (OldUserStats/OldUser) to invoke a specific legacy vtable
+# slot the current SDK header no longer names. Such a local type has a pure
+# virtual and no visible derived class, so at -O2 GCC's speculative
+# devirtualization proves the "only" target is the pure method and emits a
+# direct __cxa_pure_virtual call -> abort. The shipped DLL vtables are concrete
+# and unaffected (the crash is purely this punning in the test TU); disable
+# devirtualization here so the intended real-slot virtual dispatch survives.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(version_dispatch_test PRIVATE
+      -fno-devirtualize -fno-devirtualize-speculatively)
+endif()
 add_test(NAME version_dispatch COMMAND version_dispatch_test)
 set_tests_properties(version_dispatch PROPERTIES
     PASS_REGULAR_EXPRESSION "PASS: version_dispatch all checks passed")
